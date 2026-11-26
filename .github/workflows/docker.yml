@@ -1,0 +1,168 @@
+# GitHub Actions Docker 镜像构建发布标准模板（simple 档 + 多变体）
+# 平台标准：仅 linux/amd64；变体通过 build-args 控制（latest/ffmpeg/aria2/aio）
+# 云 CI 构建：build_binary 预编译二进制 → build_and_push 矩阵构建推送 → cleanup 统一清理
+
+name: "Publish Container Image"
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_binary:
+    name: Build Binaries for Docker
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write      # 仅供"清理旧 workflow runs"步骤使用
+      contents: read
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 完整历史，供 build.sh 的 git describe 取得 tag
+
+      - name: 清理旧 workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
+
+      - name: 设置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+
+      - name: 缓存 Musl 库
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: build/musl-libs
+          key: docker-musl-libs-v2
+
+      - name: 下载 Musl 库
+        if: steps.cache-musl.outputs.cache-hit != 'true'
+        run: bash build.sh prepare docker-multiplatform
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 注：当前 build.sh 仅有 docker-multiplatform 入口（会编译 8 个架构），
+      # 本 workflow 只用 amd64，其余架构产物会被丢弃；接受该取舍以避免改动 build.sh。
+      - name: 编译二进制（docker-multiplatform）
+        run: bash build.sh release docker-multiplatform
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
+
+      - name: 上传二进制产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries_docker_release
+          overwrite: true     # 支持 Re-run all jobs 覆盖同名 artifact
+          path: |
+            build/
+            !build/*.tgz
+            !build/musl-libs/**
+
+  build_and_push:
+    name: Build and Push Docker Image
+    needs: build_binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write      # 推送镜像到 GHCR 必需
+    strategy:
+      matrix:
+        include:
+          - variant: "latest"
+            base_image_tag: "base"
+            build_arg: ""
+            tag_suffix: ""
+          - variant: "ffmpeg"
+            base_image_tag: "ffmpeg"
+            build_arg: "INSTALL_FFMPEG=true"
+            tag_suffix: "-ffmpeg"
+          - variant: "aria2"
+            base_image_tag: "aria2"
+            build_arg: "INSTALL_ARIA2=true"
+            tag_suffix: "-aria2"
+          - variant: "aio"
+            base_image_tag: "aio"
+            build_arg: |
+              INSTALL_FFMPEG=true
+              INSTALL_ARIA2=true
+            tag_suffix: "-aio"
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载二进制产物
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries_docker_release
+          path: 'build/'
+
+      - name: 设置小写镜像名称和版本
+        run: |
+          LOWER_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "LOWER_NAME=$LOWER_NAME" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${GITHUB_SHA::8}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: 登录到 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送 Docker 镜像
+        uses: docker/build-push-action@v6
+        with:
+          file: Dockerfile.ci
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false   # 单平台无需 attestation，避免产生 untagged 子清单被 cleanup 误删
+          sbom: false
+          build-args: |
+            BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
+            ${{ matrix.build_arg }}
+          tags: |
+            ghcr.io/${{ env.LOWER_NAME }}:${{ matrix.variant }}
+            ghcr.io/${{ env.LOWER_NAME }}:${{ env.VERSION }}${{ matrix.tag_suffix }}
+
+  cleanup:
+    name: 清理未打标签的旧镜像版本
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write      # 删除包版本必需
+    steps:
+      - name: 计算小写包名
+        run: |
+          CONTAINER_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          echo "CONTAINER_NAME=$CONTAINER_NAME" >> "$GITHUB_ENV"
+
+      - name: 清理未打标签的旧镜像版本
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ env.CONTAINER_NAME }}
+          package-type: 'container'
+          min-versions-to-keep: 3
+          delete-only-untagged-versions: 'true'
